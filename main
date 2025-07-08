@@ -1,0 +1,55 @@
+import pandas as pd
+import os
+import re
+
+def consolidate_hobo_data(consolidated_file_path, file_list):
+    combined_df = pd.DataFrame()  # Start fresh each run
+
+    for new_file_path in file_list:
+        # Extract file name parts
+        file_name = os.path.basename(new_file_path)
+        parts = file_name.split('_')
+
+        # Location = part before first _
+        location = parts[0] if len(parts) >= 2 else 'UNKNOWN'
+
+        # Horizon = part between first and second _ if it contains a digit
+        if len(parts) >= 3:
+            candidate = parts[1]
+            if re.search(r'\d', candidate):
+                horizon = candidate
+            else:
+                horizon = 'UNKNOWN'
+        else:
+            horizon = 'UNKNOWN'
+
+        # Read serial number from Details
+        details_df = pd.read_excel(new_file_path, sheet_name='Details', header=None)
+        serial_number = details_df.iloc[7, 3]
+
+        # Read data
+        data_df = pd.read_excel(new_file_path, sheet_name='Data')
+
+        # Add metadata columns
+        data_df['Serial Number'] = serial_number
+        data_df['Horizon'] = horizon
+        data_df['Location'] = location
+
+        # Append this file's data
+        combined_df = pd.concat([combined_df, data_df], ignore_index=True)
+
+    # Write combined data (overwrite)
+    with pd.ExcelWriter(consolidated_file_path, engine='openpyxl') as writer:
+        combined_df.to_excel(writer, index=False, sheet_name='All Data')
+
+    print(f"Processed {len(file_list)} files. Total rows written: {len(combined_df)}.")
+
+if __name__ == "__main__":
+    consolidate_hobo_data(
+        '/Users/efe/Desktop/consolidated_hobodata.xlsx',
+        [
+            '/Users/efe/Desktop/hobo_data_surf/rsc-roof_600mm_21715637 2025-06-22 15_44_09 PDT (Data PDT).xlsx',
+            '/Users/efe/Desktop/hobo_data_surf/rsc-roof_1000mm_21195289 2025-06-22 15_47_50 PDT (Data PDT).xlsx',
+            '/Users/efe/Desktop/hobo_data_surf/mono-lake_hobo_data 21715637 2025-05-26 11_33_38 PDT (Data PDT).xlsx'
+        ]
+    )
