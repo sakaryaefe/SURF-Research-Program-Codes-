@@ -1,55 +1,138 @@
-import pandas as pd
 import os
 import re
+import pandas as pd
+from datetime import datetime, timedelta
 
-def consolidate_hobo_data(consolidated_file_path, file_list):
-    combined_df = pd.DataFrame()  # Start fresh each run
+from bokeh.plotting import figure
+from bokeh.models import ColumnDataSource
+from bokeh.palettes import Category10
+from bokeh.io.export import export_png
+from bokeh.io import output_file, save
 
-    for new_file_path in file_list:
-        # Extract file name parts
-        file_name = os.path.basename(new_file_path)
-        parts = file_name.split('_')
+def get_file_list(folder_path):
+    file_list = [
+        os.path.join(folder_path, f)
+        for f in os.listdir(folder_path)
+        if f.lower().endswith('.xlsx')
+    ]
+    hobo_path = os.path.join(folder_path, 'hobo')
+    if os.path.exists(hobo_path):
+        file_list += [
+            os.path.join(hobo_path, f)
+            for f in os.listdir(hobo_path)
+            if f.lower().endswith('.xlsx')
+        ]
+    return file_list
 
-        # Location = part before first _
-        location = parts[0] if len(parts) >= 2 else 'UNKNOWN'
+def extract_data(file_path):
+    file_name = os.path.basename(file_path)
+    parts = file_name.split('_')
+    location = parts[0] if len(parts) >= 2 else 'UNKNOWN'
+    if len(parts) >= 3:
+        candidate = parts[1]
+        horizon = candidate if re.search(r'\d', candidate) else 'UNKNOWN'
+    else:
+        horizon = 'UNKNOWN'
+    return location, horizon
 
-        # Horizon = part between first and second _ if it contains a digit
-        if len(parts) >= 3:
-            candidate = parts[1]
-            if re.search(r'\d', candidate):
-                horizon = candidate
-            else:
-                horizon = 'UNKNOWN'
-        else:
-            horizon = 'UNKNOWN'
-
-        # Read serial number from Details
-        details_df = pd.read_excel(new_file_path, sheet_name='Details', header=None)
+def transform_data(file_path, location, horizon):
+    try:
+        details_df = pd.read_excel(file_path, sheet_name='Details', header=None)
         serial_number = details_df.iloc[7, 3]
+    except Exception:
+        serial_number = 'UNKNOWN'
+    data_df = pd.read_excel(file_path, sheet_name='Data')
+    data_df['Serial Number'] = serial_number
+    data_df['Horizon'] = horizon
+    data_df['Location'] = location
+    return data_df
 
-        # Read data
-        data_df = pd.read_excel(new_file_path, sheet_name='Data')
+def generate_bokeh_plot(df, outdir, variable="Temperature (°C)"):
+    df.columns = df.columns.str.strip()
+    if 'Date-Time (PDT)' not in df.columns or variable not in df.columns:
+        print(f"Required columns not found: 'Date-Time (PDT)' and '{variable}'")
+        return
 
-        # Add metadata columns
-        data_df['Serial Number'] = serial_number
-        data_df['Horizon'] = horizon
-        data_df['Location'] = location
+    df['Date-Time'] = pd.to_datetime(df['Date-Time (PDT)'], errors='coerce')
+    df = df.dropna(subset=['Date-Time', variable, 'Location', 'Horizon'])
+    df['Group'] = df['Location'].astype(str) + " / " + df['Horizon'].astype(str)
+    df = df.sort_values('Date-Time').reset_index(drop=True)
 
-        # Append this file's data
-        combined_df = pd.concat([combined_df, data_df], ignore_index=True)
+    p = figure(title=f"24-Hour HOBO {variable} Plot",
+               x_axis_label="Hour of Day",
+               y_axis_label=variable,
+               width=800,
+               height=400)
 
-    # Write combined data (overwrite)
-    with pd.ExcelWriter(consolidated_file_path, engine='openpyxl') as writer:
-        combined_df.to_excel(writer, index=False, sheet_name='All Data')
+    groups = df['Group'].unique()
+    plotted_any = False
 
-    print(f"Processed {len(file_list)} files. Total rows written: {len(combined_df)}.")
+    for i, group in enumerate(groups):
+        sub_df = df[df['Group'] == group].copy()
+        sub_df = sub_df.sort_values('Date-Time')
+        start_time = sub_df['Date-Time'].iloc[0]
+        end_time = start_time + timedelta(days=1)
+        sub_df = sub_df[(sub_df['Date-Time'] >= start_time) & (sub_df['Date-Time'] < end_time)]
+
+        if sub_df['Date-Time'].nunique() < 10:
+            continue
+
+        sub_df['Hour'] = (
+            sub_df['Date-Time'].dt.hour +
+            sub_df['Date-Time'].dt.minute / 60 +
+            sub_df['Date-Time'].dt.second / 3600
+        )
+
+        source = ColumnDataSource(sub_df)
+        color = Category10[10][i % 10]
+        p.line(x='Hour', y=variable, source=source, legend_label=group, color=color, line_width=2)
+        plotted_any = True
+
+    if not plotted_any:
+        print("No valid groups to plot.")
+        return
+
+    p.x_range.start = 0
+    p.x_range.end = 24
+    p.legend.click_policy = "hide"
+
+    date_str = datetime.now().strftime("%Y%m%d")
+    filename = f"{date_str}_hobo_data_temp.png"
+    outpath = os.path.join(outdir, filename)
+    export_png(p, filename=outpath)
+    print(f"Plot saved to: {outpath}")
+
+def load_data(dataframes, output_path, plot_dir):
+    consolidated_df = pd.concat(dataframes, ignore_index=True)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        consolidated_df.to_excel(writer, index=False, sheet_name='All Data')
+
+    print(f"Processed {len(dataframes)} files. Total rows written: {len(consolidated_df)}.")
+    print(f"Data saved to {output_path}")
+
+    # Generate and save plot
+    generate_bokeh_plot(consolidated_df, plot_dir)
+
+def consolidate_hobo_data(folder_path, output_path, plot_dir):
+    file_list = get_file_list(folder_path)
+    if not file_list:
+        print("No Excel files found in the folder.")
+        return
+
+    all_dataframes = []
+    for file_path in file_list:
+        location, horizon = extract_data(file_path)
+        df = transform_data(file_path, location, horizon)
+        all_dataframes.append(df)
+
+    load_data(all_dataframes, output_path, plot_dir)
 
 if __name__ == "__main__":
     consolidate_hobo_data(
-        '/Users/efe/Desktop/consolidated_hobodata.xlsx',
-        [
-            '/Users/efe/Desktop/hobo_data_surf/rsc-roof_600mm_21715637 2025-06-22 15_44_09 PDT (Data PDT).xlsx',
-            '/Users/efe/Desktop/hobo_data_surf/rsc-roof_1000mm_21195289 2025-06-22 15_47_50 PDT (Data PDT).xlsx',
-            '/Users/efe/Desktop/hobo_data_surf/mono-lake_hobo_data 21715637 2025-05-26 11_33_38 PDT (Data PDT).xlsx'
-        ]
+        folder_path='/Users/efe/microbes/microbialCommunities/data/raw/hobo',
+        output_path='/Users/efe/Desktop/consolidated_hobodata.xlsx',
+        plot_dir='/Users/efe/Desktop'
     )
+
